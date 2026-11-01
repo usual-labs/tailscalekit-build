@@ -1,0 +1,146 @@
+name: Build
+
+# Builds TailscaleKit.xcframework (iPhone and the iOS Simulator) from a tailscale/libtailscale
+# commit and zips it with libtailscale's license. Start it from the Actions tab. Without
+# "publish" the zip is only kept as a workflow artifact for a week, as a trial run; with it, a
+# separate job attests the zip and publishes it as a release that Swift packages can download by
+# URL and checksum.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: tailscale/libtailscale commit to build (full 40-character SHA)
+        required: true
+        type: string
+      ios:
+        description: Lowest iOS version the framework supports
+        required: true
+        default: '18.0'
+        type: string
+      publish:
+        description: Publish a release
+        required: true
+        default: false
+        type: boolean
+
+# Each job asks for exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: build-${{ inputs.commit }}
+
+jobs:
+  build:
+    name: Build
+    runs-on: macos-26
+    timeout-minutes: 45
+    permissions:
+      contents: read # nothing else: the source comes from tailscale/libtailscale
+    steps:
+      - name: Check the inputs
+        env:
+          COMMIT: ${{ inputs.commit }}
+          IOS: ${{ inputs.ios }}
+        run: |
+          [[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::commit must be a full 40-character SHA"; exit 1; }
+          [[ "$IOS" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "::error::ios must look like 18.0"; exit 1; }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: tailscale/libtailscale
+          ref: ${{ inputs.commit }}
+          persist-credentials: false
+
+      # go.mod names the Go version libtailscale needs; Go fetches it if the installed one is older.
+      - name: Toolchain
+        run: |
+          command -v go >/dev/null || brew install go
+          go version
+          xcodebuild -version
+
+      # TailscaleKit's Xcode project asks for a newer iOS than the apps using it may support. An
+      # override file (XCODE_XCCONFIG_FILE) takes precedence over the project's settings.
+      - name: Build TailscaleKit.xcframework
+        env:
+          IOS: ${{ inputs.ios }}
+        run: |
+          printf 'IPHONEOS_DEPLOYMENT_TARGET = %s\n' "$IOS" > "$RUNNER_TEMP/override.xcconfig"
+          XCODE_XCCONFIG_FILE="$RUNNER_TEMP/override.xcconfig" make -C swift ios-fat
+
+      # The zip holds the framework and libtailscale's license, without macOS metadata files.
+      - name: Zip it and write the release notes
+        env:
+          COMMIT: ${{ inputs.commit }}
+          IOS: ${{ inputs.ios }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/zip" out
+          cp -R swift/build/Build/Products/Release-iphonefat/TailscaleKit.xcframework "$RUNNER_TEMP/zip/"
+          cp LICENSE "$RUNNER_TEMP/zip/LICENSE"
+          ditto -c -k --norsrc --noextattr --noqtn --noacl "$RUNNER_TEMP/zip" out/TailscaleKit.xcframework.zip
+          checksum=$(swift package compute-checksum out/TailscaleKit.xcframework.zip)
+          tailscale=$(awk '$1 == "tailscale.com" { print $2 }' go.mod)
+          tag="libtailscale-${COMMIT:0:7}"
+          url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/TailscaleKit.xcframework.zip"
+          echo "$tag" > out/tag
+          cat > out/notes.md <<EOF
+          TailscaleKit.xcframework for iPhone and the iOS Simulator, iOS $IOS and later, built from
+          [tailscale/libtailscale@${COMMIT:0:7}](https://github.com/tailscale/libtailscale/commit/$COMMIT)
+          (Tailscale $tailscale) by this repository's Build workflow.
+
+          In a Swift package:
+
+          \`\`\`swift
+          .binaryTarget(
+              name: "TailscaleKit",
+              url: "$url",
+              checksum: "$checksum")
+          \`\`\`
+
+          Check where the zip came from with
+          \`gh attestation verify TailscaleKit.xcframework.zip -R $GITHUB_REPOSITORY\`.
+
+          TailscaleKit is Tailscale's, under the BSD 3-Clause license in the zip's LICENSE. This is
+          an unofficial build, not made by, affiliated with or endorsed by Tailscale Inc.
+          EOF
+          cat out/notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Hand the zip to the publish job
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tailscalekit
+          path: out/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish
+    needs: build
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the release and its tag
+      id-token: write # a short-lived identity to sign the attestation
+      attestations: write # store the attestation
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tailscalekit
+          path: out
+
+      # A signed, public record that this workflow built the zip; `gh attestation verify` checks it.
+      - name: Attest the build's provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: out/TailscaleKit.xcframework.zip
+
+      # Releases are immutable once published, so the zip goes onto a draft that is then published.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(cat out/tag)
+          gh release create "$tag" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --draft \
+            --title "$tag" --notes-file out/notes.md out/TailscaleKit.xcframework.zip
+          gh release edit "$tag" -R "$GITHUB_REPOSITORY" --draft=false
